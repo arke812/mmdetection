@@ -90,24 +90,7 @@ def get_rel_pos(q_size, k_size, rel_pos):
     return rel_pos_resized[relative_coords.long()]
 
 
-def add_decomposed_rel_pos(attn, q, rel_pos_h, rel_pos_w, q_size, k_size):
-    """
-    Args:
-        attn (Tensor): attention map.
-        q (Tensor):
-            query q in the attention layer with shape (B, q_h * q_w, C).
-        rel_pos_h (Tensor):
-            relative position embeddings (Lh, C) for height axis.
-        rel_pos_w (Tensor):
-            relative position embeddings (Lw, C) for width axis.
-        q_size (Tuple):
-            spatial sequence size of query q with (q_h, q_w).
-        k_size (Tuple):
-            spatial sequence size of key k with (k_h, k_w).
-
-    Returns:
-        attn (Tensor): attention map with added relative positional embeddings.
-    """
+def add_decomposed_rel_pos(q, rel_pos_h, rel_pos_w, q_size, k_size):
     q_h, q_w = q_size
     k_h, k_w = k_size
     Rh = get_rel_pos(q_h, k_h, rel_pos_h)
@@ -118,10 +101,7 @@ def add_decomposed_rel_pos(attn, q, rel_pos_h, rel_pos_w, q_size, k_size):
     rel_h = torch.einsum('bhwc,hkc->bhwk', r_q, Rh)
     rel_w = torch.einsum('bhwc,wkc->bhwk', r_q, Rw)
 
-    attn = (attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] +
-            rel_w[:, :, :, None, :]).view(B, q_h * q_w, k_h * k_w)
-
-    return attn
+    return (rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]).reshape(B, q_h * q_w, k_h * k_w)
 
 
 def window_partition(x, window_size):
@@ -199,6 +179,8 @@ class Attention(nn.Module):
                 nn.init.trunc_normal_(self.rel_pos_w, std=0.02)
 
     def forward(self, x):
+
+
         B, H, W, _ = x.shape
         # qkv with shape (3, B, nHead, H * W, C)
         qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads,
@@ -206,15 +188,14 @@ class Attention(nn.Module):
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
-        attn = (q * self.scale) @ k.transpose(-2, -1)
-
         if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h,
-                                          self.rel_pos_w, (H, W), (H, W))
+            x = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=add_decomposed_rel_pos(q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))).view(
+                    B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
+        else:
+            x = F.scaled_dot_product_attention(q, k, v).view(
+                B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
 
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).view(B, self.num_heads, H, W,
-                            -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
         x = self.proj(x)
 
         return x
